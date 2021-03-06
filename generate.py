@@ -205,8 +205,9 @@ if __name__ == "__main__":
         latent_mean, _ = calculate_statistics(args, g_ema)
 
     saved_result = torch.load(args.proj_latent)
+
     # saved_result = torch.load('inversion/regularized/009990.pt')
-    if args.id_aware:
+    if not args.id_aware:
         latent_code = [
             saved_result[i]['latent'].unsqueeze(0)
             for i in saved_result.keys()

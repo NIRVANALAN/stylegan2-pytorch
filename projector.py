@@ -1,17 +1,21 @@
 import argparse
 import math
 import os
+from datetime import datetime
 from pathlib import Path
-
 import torch
+import numpy as np
+from PIL import Image
 from torch import optim
+from torch._C import default_generator
 from torch.nn import functional as F
 from torchvision import transforms
-from PIL import Image
 from tqdm import tqdm
 
 import lpips
 from model import Generator
+
+now = datetime.now()
 
 
 def prepare_parser():
@@ -80,7 +84,7 @@ def prepare_parser():
     )
     parser.add_argument("files",
                         metavar="FILES",
-                        nargs="+",
+                        nargs="*",
                         help="path to image files to be projected")
 
     return parser
@@ -104,12 +108,81 @@ def add_parser(parser):
         help="shared id latent code for all input files",
     )
     parser.add_argument(
+        "--sample_range",
+        type=int,
+        default=50,
+        help="how many nerf samples to choose from",
+    )
+    parser.add_argument(
         "--inject_index",
         type=int,
         default=None,
         help="injection starts from which layer in W",
     )
+    parser.add_argument("--proj_latent",
+                        type=str,
+                        default=None,
+                        help="path to the projected latent code")
+    parser.add_argument("--exp_prefix",
+                        type=str,
+                        default=None,
+                        help="experiment_prefix")
+    parser.add_argument("--nerf_pred_path",
+                        type=str,
+                        default=None,
+                        help="path to the nerf prediction")
+    parser.add_argument(
+        "--nerf_psnr_path",
+        type=str,
+        default=None,
+        help="path to the nerf model psnr.npy, load for degraded img projection"
+    )
+    parser.add_argument("--sampling_range",
+                        type=int,
+                        default=50,
+                        help="sample range")
+    parser.add_argument("--sampling_numbers",
+                        type=int,
+                        default=5,
+                        help="sample numbers")
+    parser.add_argument("--sampling_strategy",
+                        type=str,
+                        default=None,
+                        help="how to sample?")
     return parser
+
+
+def load_nerf_psnr(
+    psnr_path,
+    nerf_pred_path,
+    sampling_range=50,
+    sampling_strategy=None,
+    sampling_numbers=5,
+    verbose=True,
+):
+    psnr = np.load(psnr_path)
+    ids = np.argsort(psnr)
+    if 'last' in sampling_strategy:  # sample from good to worse
+        ids_to_proj = ids[::-1]
+
+    if 'uniform' in sampling_strategy:
+        ids_to_proj = ids[:sampling_range][::int(sampling_range /
+                                                 sampling_numbers)]
+    elif 'both' in sampling_strategy:
+        ids_to_proj = np.concatenate(
+            (ids[:sampling_numbers], ids[-sampling_numbers:]), axis=0)
+    else:
+        ids_to_proj = ids[:sampling_numbers]
+
+    if verbose:
+        print('projection on {} indices: {}'.format(ids_to_proj.shape[0],
+                                                    ids_to_proj.tolist()),
+              flush=True)
+
+    files_to_proj = [
+        Path(nerf_pred_path) / '{:03}.png'.format(idx) for idx in ids_to_proj
+    ]
+    return files_to_proj
 
 
 def noise_regularize(noises):
@@ -153,9 +226,16 @@ def get_lr(t, initial_lr, rampdown=0.25, rampup=0.05):
 def latent_noise(latents: list, strength):
     latents_n = []
 
+    # import ipdb
+    # ipdb.set_trace()
+
+    # only add noise to optim_vars
     for latent in latents:
-        noise = torch.randn_like(latent) * strength
-        latents_n.append(latent + noise)
+        if latent.requires_grad:
+            noise = torch.randn_like(latent) * strength
+            latents_n.append(latent + noise)
+        else:
+            latents_n.append(latent)
 
     # TODO
     if latents_n[1].shape != latents_n[0].shape:
@@ -188,6 +268,12 @@ if __name__ == "__main__":
     ])
 
     imgs = []
+
+    if args.nerf_pred_path != None:
+        args.files = load_nerf_psnr(args.nerf_psnr_path, args.nerf_pred_path,
+                                    args.sampling_range,
+                                    args.sampling_strategy,
+                                    args.sampling_numbers)
 
     for imgfile in args.files:
         img = transform(Image.open(imgfile).convert("RGB"))
@@ -222,15 +308,30 @@ if __name__ == "__main__":
     # prepare for latent code(s)
     if args.id_aware:
         # shared id code + independent pose code
-        latent_in = latent_mean.detach().clone().unsqueeze(0)
-        latent_pose = latent_in.repeat(imgs.shape[0],
-                                       1)  # independent pose code
-        # latent_id = latent_in.expand(imgs.shape[0], 1)  # shared identity code
-        latent_id = latent_in.repeat(1, 1)  # shared identity code
+        if args.proj_latent != None:
+            # id_aware by default
+            saved_result = torch.load(args.proj_latent)
+
+            img_keys = list(saved_result.keys())[:-1]
+
+            latent_poses = [
+                saved_result[img_name]['latent_pose'] for img_name in img_keys
+            ]
+            latent_id = saved_result['latent_id'].squeeze().repeat(
+                1, 1).detach().clone()
+            # select Nearest code?
+            latent_pose = torch.stack(latent_poses).mean(0).detach().clone()
+            latent_pose = latent_pose.repeat(imgs.shape[0], 1)
+        else:
+            latent_in = latent_mean.detach().clone().unsqueeze(0)
+            latent_pose = latent_in.repeat(imgs.shape[0],
+                                           1)  # independent pose code
+            # latent_id = latent_in.expand(imgs.shape[0], 1)  # shared identity code
+            latent_id = latent_in.repeat(1, 1)  # shared identity code
+
+            latent_id.requires_grad = True
 
         latent_pose.requires_grad = True
-        latent_id.requires_grad = True
-
         latents = [latent_pose, latent_id]
     else:
         latent_in = latent_mean.detach().clone().unsqueeze(0).repeat(
@@ -310,13 +411,20 @@ if __name__ == "__main__":
                        inject_index=args.inject_index)
 
     # prepare save path
+    path_base = Path('inversion')
     if args.grid_search:
         # debug mode
-        path_base = Path('inversion') / "grid_search" / args.mse / args.noise
+        path_base = path_base / "grid_search" / args.mse / args.noise
     else:
-        path_base = Path('inversion')
-        if args.id_aware:
-            path_base = path_base / 'id_aware'
+        if args.proj_latent != None:
+            path_base /= ('proj_' +
+                          args.proj_latent.split('/')[-1].split('.')[0])
+
+        path_base = path_base / (
+            now.strftime('%b_%d_%H:%M') + '_{}_{}_{}'.format(
+                args.step, args.sampling_strategy, args.sampling_numbers)
+        )  # timestamp
+    print('saving to path_base: {}'.format(path_base))
     if not path_base.exists():
         path_base.mkdir(parents=True)
 
@@ -325,13 +433,11 @@ if __name__ == "__main__":
     img_ar = make_image(img_gen)
     result_file = {}
 
-    # import ipdb
-    # ipdb.set_trace()
-
     for i, input_name in enumerate(args.files):
-        filename = '{}_inject{}_{}imgs'.format(
+        filename = '{}_{}imgs'.format(
             os.path.splitext(os.path.basename(args.files[i]))[0],
-            args.inject_index, len(args.files))
+            # args.inject_index,
+            len(args.files))
 
         noise_single = []
         for noise in noises:
