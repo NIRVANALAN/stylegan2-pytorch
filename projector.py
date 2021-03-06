@@ -7,7 +7,6 @@ import torch
 import numpy as np
 from PIL import Image
 from torch import optim
-from torch._C import default_generator
 from torch.nn import functional as F
 from torchvision import transforms
 from tqdm import tqdm
@@ -63,10 +62,10 @@ def prepare_parser():
         default=1e5,
         help="weight of the noise regularization",
     )
-    parser.add_argument("--mse",
+    parser.add_argument("--w_l1",
                         type=float,
                         default=0,
-                        help="weight of the mse loss")
+                        help="weight of the l1 loss")
     parser.add_argument(
         "--no_noise_explore",
         action="store_true",
@@ -163,14 +162,18 @@ def load_nerf_psnr(
     psnr = np.load(psnr_path)
     ids = np.argsort(psnr)
     if 'last' in sampling_strategy:  # sample from good to worse
-        ids_to_proj = ids[::-1]
+        assert 'uniform' not in sampling_strategy
+        ids = ids[::-1]
+
+    if 'both' in sampling_strategy:
+        ids = np.concatenate((ids[:sampling_range], ids[-sampling_range:]), 0)
 
     if 'uniform' in sampling_strategy:
-        ids_to_proj = ids[:sampling_range][::int(sampling_range /
-                                                 sampling_numbers)]
+        ids_to_proj = ids[::int(sampling_range / sampling_numbers)]
+
     elif 'both' in sampling_strategy:
         ids_to_proj = np.concatenate(
-            (ids[:sampling_numbers], ids[-sampling_numbers:]), axis=0)
+            (ids[:sampling_numbers], ids[-sampling_numbers:]), 0)
     else:
         ids_to_proj = ids[:sampling_numbers]
 
@@ -387,7 +390,9 @@ if __name__ == "__main__":
         n_loss = noise_regularize(noises)
         mse_loss = F.mse_loss(img_gen, imgs)
 
-        loss = p_loss + args.noise_regularize * n_loss + args.mse * mse_loss
+        l1_loss = F.l1_loss(img_gen, imgs)
+
+        loss = p_loss + args.noise_regularize * n_loss + args.w_l1 * l1_loss
 
         # step
         optimizer.zero_grad()
@@ -402,7 +407,8 @@ if __name__ == "__main__":
                 [latent.detach().clone() for latent in latents_n])
         pbar.set_description((
             f"perceptual: {p_loss.item():.4f}; noise regularize: {n_loss.item():.4f};"
-            f" mse: {mse_loss.item():.4f}; lr: {lr:.4f}"))
+            f" mse: {mse_loss.item():.4f};  l1: {l1_loss.item():.4f}; lr: {lr:.4f}"
+        ))
 
     # get last result
     img_gen, _ = g_ema(latent_path[-1],
@@ -421,15 +427,21 @@ if __name__ == "__main__":
                           args.proj_latent.split('/')[-1].split('.')[0])
 
         path_base = path_base / (
-            now.strftime('%b_%d_%H:%M') + '_{}_{}_{}'.format(
-                args.step, args.sampling_strategy, args.sampling_numbers)
-        )  # timestamp
+            now.strftime('%b_%d_%H_%M') + '_{}_{}_{}_noise{}_l1{}'.format(
+                args.step, args.sampling_strategy, args.sampling_numbers,
+                args.noise, args.w_l1))  # timestamp
+
     print('saving to path_base: {}'.format(path_base))
     if not path_base.exists():
         path_base.mkdir(parents=True)
 
+    # save log
+    with open(path_base / 'loss.log', 'w') as f:
+        f.write(
+            f"perceptual: {p_loss.item():.4f};\n noise regularize: {n_loss.item():.4f};\n"
+            f" mse: {mse_loss.item():.4f};\n  l1: {l1_loss.item():.4f}; lr: {lr:.4f}\n"
+        )
     # save results
-
     img_ar = make_image(img_gen)
     result_file = {}
 
