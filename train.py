@@ -467,7 +467,7 @@ if __name__ == "__main__":
     args.n_mlp = 8
 
     args.start_iter = 0
-    args.expname = Path('{}_size{}_r1{}_lr{}_bs{}_iter{}'.format(
+    args.expname = Path('{}_size{}_gamma{}_lr{}_bs{}_iter{}'.format(
         Path(args.path).name, args.size, args.r1, args.lr, args.batch,
         args.iter))
     print('expname: {}'.format(args.expname))

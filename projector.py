@@ -11,6 +11,8 @@ from torch.nn import functional as F
 from torchvision import transforms
 from tqdm import tqdm
 
+from model import Discriminator
+
 import lpips
 from model import Generator
 
@@ -63,6 +65,10 @@ def prepare_parser():
         help="weight of the noise regularization",
     )
     parser.add_argument("--w_l1",
+                        type=float,
+                        default=0,
+                        help="weight of the l1 loss")
+    parser.add_argument("--w_l2",
                         type=float,
                         default=0,
                         help="weight of the l1 loss")
@@ -148,25 +154,37 @@ def add_parser(parser):
                         type=str,
                         default=None,
                         help="how to sample?")
+    parser.add_argument(
+        "--d_loss",
+        action="store_true",
+        help="use discriminator_perceptual_loss",
+    )
     return parser
 
 
 def load_nerf_psnr(
     psnr_path,
-    nerf_pred_path,
+    # nerf_pred_path,
     sampling_range=50,
     sampling_strategy=None,
     sampling_numbers=5,
     verbose=True,
 ):
     psnr = np.load(psnr_path)
+
+    nerf_pred_path = Path(psnr_path).parent / 'testset_{}'.format(
+        psnr_path.split('/')[-1].split('.')[0].split('_')[-1])
+
     ids = np.argsort(psnr)
     if 'last' in sampling_strategy:  # sample from good to worse
         assert 'uniform' not in sampling_strategy
         ids = ids[::-1]
 
     if 'both' in sampling_strategy:
-        ids = np.concatenate((ids[:sampling_range], ids[-sampling_range:]), 0)
+        ids = np.concatenate(
+            (ids[:sampling_range / 2], ids[-sampling_range / 2:]), 0)
+    else:
+        ids = ids[:sampling_range]
 
     if 'uniform' in sampling_strategy:
         ids_to_proj = ids[::int(sampling_range / sampling_numbers)]
@@ -272,9 +290,8 @@ if __name__ == "__main__":
 
     imgs = []
 
-    if args.nerf_pred_path != None:
-        args.files = load_nerf_psnr(args.nerf_psnr_path, args.nerf_pred_path,
-                                    args.sampling_range,
+    if args.nerf_psnr_path != None:
+        args.files = load_nerf_psnr(args.nerf_psnr_path, args.sampling_range,
                                     args.sampling_strategy,
                                     args.sampling_numbers)
 
@@ -299,9 +316,16 @@ if __name__ == "__main__":
         latent_std = ((latent_out - latent_mean).pow(2).sum() /
                       n_mean_latent)**0.5
 
-    percept = lpips.PerceptualLoss(model="net-lin",
-                                   net="vgg",
-                                   use_gpu=device.startswith("cuda"))
+    if args.d_loss:
+        D = Discriminator(args.size).cuda()
+        ckpt_d = torch.load(args.ckpt,
+                            map_location=lambda storage, loc: storage)['d']
+        D.load_state_dict(ckpt_d)
+        percept = lpips.DiscriminatorLoss(D, 4, False)
+    else:
+        percept = lpips.PerceptualLoss(model="net-lin",
+                                       net="vgg",
+                                       use_gpu=device.startswith("cuda"))
 
     noises_single = g_ema.make_noise()
     noises = []
@@ -384,15 +408,20 @@ if __name__ == "__main__":
                                       width // factor, factor)
             img_gen = img_gen.mean([3, 5])
 
-        p_loss = percept(img_gen, imgs).sum()
+        if args.d_loss:
+            p_loss = 0
+            for idx in range(0, len(img_gen), 4):  # d_loss bs divisible by 4
+                p_loss += percept(img_gen[idx:idx + 4], imgs[idx:idx + 4])
+        else:
+            p_loss = percept(img_gen, imgs).sum()
         if args.normalize_vgg_loss:
             p_loss /= imgs.shape[0]
         n_loss = noise_regularize(noises)
-        mse_loss = F.mse_loss(img_gen, imgs)
+        l2_loss = F.mse_loss(img_gen, imgs)
 
         l1_loss = F.l1_loss(img_gen, imgs)
 
-        loss = p_loss + args.noise_regularize * n_loss + args.w_l1 * l1_loss
+        loss = p_loss + args.noise_regularize * n_loss + args.w_l1 * l1_loss + args.w_l2 * l2_loss
 
         # step
         optimizer.zero_grad()
@@ -407,7 +436,7 @@ if __name__ == "__main__":
                 [latent.detach().clone() for latent in latents_n])
         pbar.set_description((
             f"perceptual: {p_loss.item():.4f}; noise regularize: {n_loss.item():.4f};"
-            f" mse: {mse_loss.item():.4f};  l1: {l1_loss.item():.4f}; lr: {lr:.4f}"
+            f" mse: {l2_loss.item():.4f};  l1: {l1_loss.item():.4f}; lr: {lr:.4f}"
         ))
 
     # get last result
@@ -439,7 +468,7 @@ if __name__ == "__main__":
     with open(path_base / 'loss.log', 'w') as f:
         f.write(
             f"perceptual: {p_loss.item():.4f};\n noise regularize: {n_loss.item():.4f};\n"
-            f" mse: {mse_loss.item():.4f};\n  l1: {l1_loss.item():.4f}; lr: {lr:.4f}\n"
+            f" mse: {l2_loss.item():.4f};\n  l1: {l1_loss.item():.4f}; lr: {lr:.4f}\n"
         )
     # save results
     img_ar = make_image(img_gen)
